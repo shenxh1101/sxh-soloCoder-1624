@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { activityService } from '../services/ActivityService';
 import { attendanceService } from '../services/AttendanceService';
 import { successResponse, createdResponse, errorResponse, paginatedResponse, validationErrorResponse } from '../utils/response';
-import { ActivityStatus, ApprovalLevel, ApprovalStatus } from '../types';
+import { ActivityStatus, ApprovalLevel, ApprovalStatus, UserRole } from '../types';
 
 const router = Router();
 
@@ -78,7 +78,29 @@ router.post('/approvals/:id/process', async (req: Request, res: Response) => {
 router.get('/approvals/check-timeouts', async (req: Request, res: Response) => {
   try {
     const result = await activityService.checkApprovalTimeouts();
-    return successResponse(res, { processed: result.reminded + result.escalated, ...result }, '审批超时检查完成');
+    return successResponse(res, result, `审批超时检查完成，共处理 ${result.total} 条`);
+  } catch (error) {
+    return errorResponse(res, (error as Error).message, 500);
+  }
+});
+
+router.get('/approvals/dashboard', async (req: Request, res: Response) => {
+  try {
+    const { userId, userRole } = req.query;
+
+    if (!userId) {
+      return errorResponse(res, '请提供用户ID', 400);
+    }
+    if (!userRole) {
+      return errorResponse(res, '请提供用户角色', 400);
+    }
+
+    const dashboard = await activityService.getApprovalDashboard(
+      userId as string,
+      userRole as UserRole
+    );
+
+    return successResponse(res, dashboard);
   } catch (error) {
     return errorResponse(res, (error as Error).message, 500);
   }
@@ -109,7 +131,7 @@ router.get('/:id/approval-flow', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const flow = await activityService.getApprovalFlow(id);
-    return successResponse(res, { items: flow, total: flow.length });
+    return successResponse(res, flow);
   } catch (error) {
     return errorResponse(res, (error as Error).message, 500);
   }

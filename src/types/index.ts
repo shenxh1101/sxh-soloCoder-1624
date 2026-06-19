@@ -78,6 +78,50 @@ export enum ApprovalFlowAction {
   REACTIVATED = 'reactivated'
 }
 
+export enum FlowNodeStatus {
+  COMPLETED = 'completed',
+  CURRENT = 'current',
+  PENDING = 'pending',
+  SKIPPED = 'skipped'
+}
+
+export interface ApprovalFlowNode {
+  id: string;
+  action: ApprovalFlowAction;
+  level: ApprovalLevel | null;
+  levelText: string | null;
+  actionText: string;
+  displayStatus: FlowNodeStatus;
+  actorId: string | null;
+  actorName: string | null;
+  comment: string | null;
+  description: string | null;
+  createdAt: Date;
+  timeText: string;
+  icon: string;
+}
+
+export interface ApprovalDashboardStats {
+  pendingAdvisor: number;
+  pendingLeague: number;
+  timeout: number;
+  completed: number;
+  total: number;
+}
+
+export interface ApprovalDashboardItem {
+  id: string;
+  activityTitle: string;
+  clubName: string;
+  currentLevel: ApprovalLevel | null;
+  currentLevelText: string | null;
+  status: ApprovalStatus;
+  statusText: string;
+  isTimeout: boolean;
+  createdAt: Date;
+  reminderCount: number;
+}
+
 export enum ApprovalLevel {
   ADVISOR = 'advisor',
   LEAGUE_COMMITTEE = 'league_committee'

@@ -1,6 +1,7 @@
 import { Repository, Between, LessThanOrEqual, In } from 'typeorm';
 import { Activity, ActivityApproval, ActivityApprovalFlow, Club, User } from '../entities';
-import { ActivityStatus, ApprovalStatus, ApprovalLevel, NotificationType, UserRole, ApprovalFlowAction } from '../types';
+import { ActivityStatus, ApprovalStatus, ApprovalLevel, NotificationType, UserRole, ApprovalFlowAction, FlowNodeStatus } from '../types';
+import type { ApprovalFlowNode, ApprovalDashboardStats, ApprovalDashboardItem } from '../types';
 import { AppDataSource } from '../config/database';
 import { notificationService } from './NotificationService';
 import { clubService } from './ClubService';
@@ -226,6 +227,27 @@ class ActivityService {
       description: `${levelText}${statusText}${comment ? `，意见：${comment}` : ''}`,
     });
 
+    if (approval.level === ApprovalLevel.LEAGUE_COMMITTEE) {
+      const advisorApproval = approval.activity.approvals.find(
+        a => a.level === ApprovalLevel.ADVISOR
+      );
+      if (advisorApproval && advisorApproval.status === ApprovalStatus.ESCALATED) {
+        advisorApproval.status = approved ? ApprovalStatus.APPROVED : ApprovalStatus.REJECTED;
+        advisorApproval.approverId = approverId;
+        advisorApproval.comment = comment || '超时升级后由团委一并处理';
+        advisorApproval.reviewedAt = new Date();
+        await this.approvalRepository.save(advisorApproval);
+
+        await this.addFlowRecord(approval.activityId, approved ? ApprovalFlowAction.APPROVED : ApprovalFlowAction.REJECTED, {
+          level: ApprovalLevel.ADVISOR,
+          actorId: approverId,
+          actorName: approverName,
+          comment: comment || '超时升级后由团委一并处理',
+          description: `指导老师审批超时升级，由团委${statusText}`,
+        });
+      }
+    }
+
     await this.checkAndUpdateActivityStatus(approval.activityId);
 
     const activity = approval.activity;
@@ -323,7 +345,7 @@ class ActivityService {
     }
   }
 
-  async checkApprovalTimeouts(): Promise<{ reminded: number; escalated: number; }> {
+  async checkApprovalTimeouts(): Promise<{ reminded: number; escalated: number; total: number; }> {
     const now = new Date();
     const timeoutDate = new Date(now.getTime() - APPROVAL_TIMEOUT_HOURS * 60 * 60 * 1000);
 
@@ -375,7 +397,7 @@ class ActivityService {
             level: ApprovalLevel.LEAGUE_COMMITTEE,
           }
         });
-        if (leagueApproval) {
+        if (leagueApproval && (leagueApproval.status === ApprovalStatus.QUEUED || leagueApproval.status === ApprovalStatus.PENDING)) {
           leagueApproval.status = ApprovalStatus.PENDING;
           leagueApproval.escalated = true;
           leagueApproval.escalatedAt = now;
@@ -517,7 +539,7 @@ class ActivityService {
       }
     }
 
-    return { reminded, escalated };
+    return { reminded, escalated, total: reminded + escalated };
   }
 
   async getActivityById(activityId: string): Promise<Activity | null> {
@@ -527,11 +549,103 @@ class ActivityService {
     });
   }
 
-  async getApprovalFlow(activityId: string): Promise<ActivityApprovalFlow[]> {
-    return this.flowRepository.find({
+  async getApprovalFlow(activityId: string): Promise<{ nodes: ApprovalFlowNode[]; total: number; }> {
+    const flowRecords = await this.flowRepository.find({
       where: { activityId },
       order: { createdAt: 'ASC' }
     });
+
+    const activity = await this.activityRepository.findOne({
+      where: { id: activityId },
+      relations: ['approvals']
+    });
+
+    const currentLevel = activity ? this.getCurrentApprovalLevel(activity.approvals) : null;
+    const isCompleted = activity && (activity.status === ActivityStatus.APPROVED || activity.status === ActivityStatus.REJECTED);
+
+    const actionTextMap: Record<ApprovalFlowAction, string> = {
+      [ApprovalFlowAction.SUBMITTED]: '提交审批',
+      [ApprovalFlowAction.APPROVED]: '通过',
+      [ApprovalFlowAction.REJECTED]: '拒绝',
+      [ApprovalFlowAction.REMINDER]: '催办',
+      [ApprovalFlowAction.ESCALATED]: '升级',
+      [ApprovalFlowAction.COMPLETED]: '审批完成',
+      [ApprovalFlowAction.REACTIVATED]: '进入下一阶段',
+    };
+
+    const iconMap: Record<ApprovalFlowAction, string> = {
+      [ApprovalFlowAction.SUBMITTED]: '📝',
+      [ApprovalFlowAction.APPROVED]: '✅',
+      [ApprovalFlowAction.REJECTED]: '❌',
+      [ApprovalFlowAction.REMINDER]: '⏰',
+      [ApprovalFlowAction.ESCALATED]: '⬆️',
+      [ApprovalFlowAction.COMPLETED]: '🏁',
+      [ApprovalFlowAction.REACTIVATED]: '➡️',
+    };
+
+    const levelTextMap: Record<ApprovalLevel, string> = {
+      [ApprovalLevel.ADVISOR]: '指导老师',
+      [ApprovalLevel.LEAGUE_COMMITTEE]: '团委',
+    };
+
+    const nodes: ApprovalFlowNode[] = flowRecords.map((record, index) => {
+      let displayStatus = FlowNodeStatus.COMPLETED;
+      
+      if (!isCompleted && index === flowRecords.length - 1) {
+        if (record.action === ApprovalFlowAction.SUBMITTED || 
+            record.action === ApprovalFlowAction.REACTIVATED ||
+            record.action === ApprovalFlowAction.REMINDER ||
+            record.action === ApprovalFlowAction.ESCALATED) {
+          displayStatus = FlowNodeStatus.CURRENT;
+        }
+      }
+
+      return {
+        id: record.id,
+        action: record.action,
+        level: record.level,
+        levelText: record.level ? levelTextMap[record.level] : null,
+        actionText: actionTextMap[record.action],
+        displayStatus,
+        actorId: record.actorId,
+        actorName: record.actorName,
+        comment: record.comment,
+        description: record.description,
+        createdAt: record.createdAt,
+        timeText: this.formatDateTime(record.createdAt),
+        icon: iconMap[record.action],
+      };
+    });
+
+    if (activity && !isCompleted) {
+      const advisorApproval = activity.approvals.find(a => a.level === ApprovalLevel.ADVISOR);
+      const leagueApproval = activity.approvals.find(a => a.level === ApprovalLevel.LEAGUE_COMMITTEE);
+
+      if (leagueApproval && leagueApproval.status === ApprovalStatus.QUEUED) {
+        nodes.push({
+          id: `pending-league-${activityId}`,
+          action: ApprovalFlowAction.REACTIVATED,
+          level: ApprovalLevel.LEAGUE_COMMITTEE,
+          levelText: '团委',
+          actionText: '待团委审批',
+          displayStatus: FlowNodeStatus.PENDING,
+          actorId: null,
+          actorName: null,
+          comment: null,
+          description: '等待前级审批完成',
+          createdAt: new Date(),
+          timeText: '待定',
+          icon: '⏳',
+        });
+      }
+    }
+
+    return { nodes, total: nodes.length };
+  }
+
+  private formatDateTime(date: Date): string {
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
   getCurrentApprovalLevel(approvals: ActivityApproval[]): ApprovalLevel | null {
@@ -607,6 +721,108 @@ class ActivityService {
     }
 
     return { items, total, currentLevel };
+  }
+
+  async getApprovalDashboard(
+    userId: string,
+    userRole: UserRole
+  ): Promise<{
+    stats: ApprovalDashboardStats;
+    pendingAdvisor: ApprovalDashboardItem[];
+    pendingLeague: ApprovalDashboardItem[];
+    timeout: ApprovalDashboardItem[];
+    completed: ApprovalDashboardItem[];
+  }> {
+    const now = new Date();
+    const timeoutDate = new Date(now.getTime() - APPROVAL_TIMEOUT_HOURS * 60 * 60 * 1000);
+
+    const activityQuery = this.activityRepository.createQueryBuilder('activity')
+      .leftJoinAndSelect('activity.club', 'club')
+      .leftJoinAndSelect('activity.approvals', 'approval')
+      .where('activity.status IN (:...statuses)', { statuses: [ActivityStatus.PENDING_APPROVAL, ActivityStatus.APPROVED, ActivityStatus.REJECTED] });
+
+    if (userRole === UserRole.CLUB_LEADER) {
+      activityQuery.andWhere('club.leaderId = :userId', { userId });
+    } else if (userRole === UserRole.ADVISOR) {
+      activityQuery.andWhere('club.advisorId = :userId', { userId });
+    }
+
+    const activities = await activityQuery
+      .orderBy('activity.createdAt', 'DESC')
+      .getMany();
+
+    const statusTextMap: Record<ApprovalStatus, string> = {
+      [ApprovalStatus.PENDING]: '待处理',
+      [ApprovalStatus.APPROVED]: '已通过',
+      [ApprovalStatus.REJECTED]: '已拒绝',
+      [ApprovalStatus.ESCALATED]: '已升级',
+      [ApprovalStatus.TIMEOUT]: '已超时',
+      [ApprovalStatus.QUEUED]: '排队中',
+    };
+
+    const levelTextMap: Record<ApprovalLevel, string> = {
+      [ApprovalLevel.ADVISOR]: '指导老师',
+      [ApprovalLevel.LEAGUE_COMMITTEE]: '团委',
+    };
+
+    const buildItem = (activity: Activity): ApprovalDashboardItem => {
+      const currentLevel = this.getCurrentApprovalLevel(activity.approvals);
+      const oldestPendingApproval = activity.approvals
+        .filter(a => a.status === ApprovalStatus.PENDING || a.status === ApprovalStatus.ESCALATED)
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())[0];
+
+      const isTimeout = oldestPendingApproval ? 
+        (oldestPendingApproval.lastReminderAt || oldestPendingApproval.createdAt) <= timeoutDate : false;
+
+      const relevantApproval = activity.approvals.find(a => currentLevel ? 
+        (a.level === currentLevel && (a.status === ApprovalStatus.PENDING || a.status === ApprovalStatus.ESCALATED)) :
+        (a.status === ApprovalStatus.APPROVED || a.status === ApprovalStatus.REJECTED)
+      ) || activity.approvals[0];
+
+      return {
+        id: activity.id,
+        activityTitle: activity.title,
+        clubName: activity.club?.name || '未知社团',
+        currentLevel,
+        currentLevelText: currentLevel ? levelTextMap[currentLevel] : null,
+        status: relevantApproval?.status || ApprovalStatus.PENDING,
+        statusText: relevantApproval ? statusTextMap[relevantApproval.status] : '待处理',
+        isTimeout,
+        createdAt: activity.createdAt,
+        reminderCount: oldestPendingApproval?.reminderCount || 0,
+      };
+    };
+
+    const items = activities.map(buildItem);
+
+    const pendingAdvisor = items.filter(item => 
+      item.currentLevel === ApprovalLevel.ADVISOR && 
+      (item.status === ApprovalStatus.PENDING || item.status === ApprovalStatus.ESCALATED)
+    );
+
+    const pendingLeague = items.filter(item => 
+      item.currentLevel === ApprovalLevel.LEAGUE_COMMITTEE && 
+      (item.status === ApprovalStatus.PENDING || item.status === ApprovalStatus.ESCALATED)
+    );
+
+    const timeout = items.filter(item => 
+      item.isTimeout && 
+      (item.status === ApprovalStatus.PENDING || item.status === ApprovalStatus.ESCALATED)
+    );
+
+    const completed = items.filter(item => 
+      item.status === ApprovalStatus.APPROVED || item.status === ApprovalStatus.REJECTED
+    );
+
+    const stats: ApprovalDashboardStats = {
+      pendingAdvisor: pendingAdvisor.length,
+      pendingLeague: pendingLeague.length,
+      timeout: timeout.length,
+      completed: completed.length,
+      total: items.length,
+    };
+
+    return { stats, pendingAdvisor, pendingLeague, timeout, completed };
   }
 
   async completeActivity(activityId: string, actualCost: number, actualParticipants: number): Promise<Activity | null> {
