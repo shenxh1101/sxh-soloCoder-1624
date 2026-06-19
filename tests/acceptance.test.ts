@@ -257,7 +257,7 @@ describe('3. 超预算多级审批', () => {
     activityId = res.body.data.id;
   });
 
-  test('3.2 提交审批后生成指导老师+团委两级审批', async () => {
+  test('3.2 提交审批后生成指导老师+团委两级审批，团委先排队', async () => {
     const res = await req()
       .post(`/api/activities/${activityId}/submit`);
 
@@ -272,16 +272,16 @@ describe('3. 超预算多级审批', () => {
       (a: any) => a.level === 'league_committee'
     );
 
+    advisorApprovalId = advisorApp.id;
+    leagueApprovalId = leagueApp.id;
+
     expect(advisorApp).toBeDefined();
     expect(leagueApp).toBeDefined();
     expect(advisorApp.status).toBe('pending');
-    expect(leagueApp.status).toBe('pending');
-
-    advisorApprovalId = advisorApp.id;
-    leagueApprovalId = leagueApp.id;
+    expect(leagueApp.status).toBe('queued');
   });
 
-  test('3.3 团委在指导老师审批前不能直接通过', async () => {
+  test('3.3 团委在指导老师审批前不能直接处理（QUEUED 状态提示明确原因）', async () => {
     const res = await req()
       .post(`/api/activities/approvals/${leagueApprovalId}/process`)
       .send({
@@ -291,7 +291,7 @@ describe('3. 超预算多级审批', () => {
       });
 
     expect(res.status).toBe(400);
-    expect(res.body.message).toContain('指导老师尚未审批');
+    expect(res.body.message).toContain('尚未进入待处理状态');
   });
 
   test('3.4 指导老师审批通过后，团委可审批', async () => {
@@ -463,7 +463,7 @@ describe('5. 审批超时催办', () => {
     expect(timeoutLeagueApprovalId).toBeDefined();
   });
 
-  test('5.2 团委不能跳过指导老师直接审批', async () => {
+  test('5.2 团委不能跳过指导老师直接审批（QUEUED 状态明确提示）', async () => {
     const res = await req()
       .post(`/api/activities/approvals/${timeoutLeagueApprovalId}/process`)
       .send({
@@ -472,7 +472,7 @@ describe('5. 审批超时催办', () => {
       });
 
     expect(res.status).toBe(400);
-    expect(res.body.message).toContain('指导老师尚未审批');
+    expect(res.body.message).toContain('尚未进入待处理状态');
   });
 
   test('5.3 指导老师审批后团委可审批', async () => {
@@ -494,5 +494,405 @@ describe('5. 审批超时催办', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('approved');
+  });
+});
+
+describe('6. 审批流转记录与超时催办完整流程', () => {
+  let flowActivityId: string;
+  let flowAdvisorApprovalId: string;
+  let flowLeagueApprovalId: string;
+
+  test('6.1 创建超预算活动并提交', async () => {
+    const createRes = await req()
+      .post('/api/activities')
+      .send({
+        title: '流转记录完整测试_' + Date.now(),
+        description: '测试审批流转记录和超时催办',
+        category: 'lecture',
+        startTime: '2026-11-01T09:00:00Z',
+        endTime: '2026-11-01T17:00:00Z',
+        budget: 3000,
+        expectedParticipants: 80,
+        clubId
+      });
+
+    expect(createRes.status).toBe(201);
+    flowActivityId = createRes.body.data.id;
+
+    const submitRes = await req()
+      .post(`/api/activities/${flowActivityId}/submit`);
+
+    expect(submitRes.status).toBe(200);
+    const approvals = submitRes.body.data.approvals;
+    flowAdvisorApprovalId = approvals.find((a: any) => a.level === 'advisor').id;
+    flowLeagueApprovalId = approvals.find((a: any) => a.level === 'league_committee').id;
+  });
+
+  test('6.2 提交后团委状态为 queued（排队），当前待办是指导老师', async () => {
+    const res = await req()
+      .get('/api/activities/approvals')
+      .query({ activityId: flowActivityId });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.currentLevel).toBe('advisor');
+
+    const items = res.body.data.items;
+    const advisor = items.find((a: any) => a.level === 'advisor');
+    const league = items.find((a: any) => a.level === 'league_committee');
+
+    expect(advisor.status).toBe('pending');
+    expect(league.status).toBe('queued');
+  });
+
+  test('6.3 提交后指导老师收到待办通知，团委暂未收到', async () => {
+    const advisorNotifRes = await req()
+      .get(`/api/notifications/user/${advisorId}`)
+      .query({ unread: 'true' });
+
+    expect(advisorNotifRes.status).toBe(200);
+    const advisorNotifs = advisorNotifRes.body.data.items || [];
+    const hasApprovalNotif = advisorNotifs.some(
+      (n: any) => n.relatedId === flowActivityId && n.type === 'activity_approval'
+    );
+    expect(hasApprovalNotif).toBe(true);
+
+    const committeeNotifRes = await req()
+      .get(`/api/notifications/user/${committeeId}`)
+      .query({ unread: 'true' });
+
+    expect(committeeNotifRes.status).toBe(200);
+    const committeeNotifs = committeeNotifRes.body.data.items || [];
+    const hasCommitteeApprovalNotif = committeeNotifs.some(
+      (n: any) => n.relatedId === flowActivityId && n.type === 'activity_approval' && n.title.includes('团委')
+    );
+    expect(hasCommitteeApprovalNotif).toBe(false);
+  });
+
+  test('6.4 团委提前点通过返回明确原因（QUEUED 状态不可处理）', async () => {
+    const res = await req()
+      .post(`/api/activities/approvals/${flowLeagueApprovalId}/process`)
+      .send({
+        approverId: committeeId,
+        approved: true,
+        comment: '团委想提前通过'
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toContain('尚未进入待处理状态');
+  });
+
+  test('6.5 流转记录包含提交节点', async () => {
+    const res = await req()
+      .get(`/api/activities/${flowActivityId}/approval-flow`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    const flow = res.body.data.items;
+    expect(flow.length).toBeGreaterThanOrEqual(1);
+
+    const submitted = flow.find((f: any) => f.action === 'submitted');
+    expect(submitted).toBeDefined();
+    expect(submitted.description).toContain('指导老师');
+  });
+
+  test('6.6 模拟创建超过4小时，第一次催办通知产生', async () => {
+    const approvalRepo = AppDataSource.getRepository(
+      require('../src/entities/ActivityApproval').ActivityApproval
+    );
+
+    const fourHoursAgo = new Date(Date.now() - 5 * 60 * 60 * 1000);
+    await approvalRepo.update(flowAdvisorApprovalId, {
+      createdAt: fourHoursAgo,
+      lastReminderAt: null
+    });
+
+    const timeoutRes = await req().get('/api/activities/approvals/check-timeouts');
+    expect(timeoutRes.status).toBe(200);
+    expect(timeoutRes.body.data.reminded).toBeGreaterThanOrEqual(1);
+
+    const advisorNotifRes = await req()
+      .get(`/api/notifications/user/${advisorId}`);
+
+    const advisorNotifs = advisorNotifRes.body.data.items || [];
+    const hasReminder = advisorNotifs.some(
+      (n: any) => n.relatedId === flowActivityId && n.type === 'approval_reminder' && n.title.includes('催办')
+    );
+    expect(hasReminder).toBe(true);
+  });
+
+  test('6.7 第一次催办后流转记录新增 reminder 节点', async () => {
+    const res = await req()
+      .get(`/api/activities/${flowActivityId}/approval-flow`);
+
+    const flow = res.body.data.items;
+    const reminder = flow.find((f: any) => f.action === 'reminder' && f.level === 'advisor');
+    expect(reminder).toBeDefined();
+    expect(reminder.description).toContain('催办');
+  });
+
+  test('6.8 再次超时（累计2次），指导老师审批升级到团委', async () => {
+    const approvalRepo = AppDataSource.getRepository(
+      require('../src/entities/ActivityApproval').ActivityApproval
+    );
+
+    const fiveHoursAgo = new Date(Date.now() - 5 * 60 * 60 * 1000);
+    await approvalRepo.update(flowAdvisorApprovalId, {
+      lastReminderAt: fiveHoursAgo
+    });
+
+    const timeoutRes = await req().get('/api/activities/approvals/check-timeouts');
+    expect(timeoutRes.status).toBe(200);
+    expect(timeoutRes.body.data.escalated).toBeGreaterThanOrEqual(1);
+
+    const approvalsRes = await req()
+      .get('/api/activities/approvals')
+      .query({ activityId: flowActivityId });
+
+    const items = approvalsRes.body.data.items;
+    const advisor = items.find((a: any) => a.level === 'advisor');
+    const league = items.find((a: any) => a.level === 'league_committee');
+
+    expect(advisor.status).toBe('escalated');
+    expect(league.status).toBe('pending');
+    expect(advisor.escalated).toBe(true);
+  });
+
+  test('6.9 升级后团委和管理员都能查到升级通知', async () => {
+    const committeeNotifRes = await req()
+      .get(`/api/notifications/user/${committeeId}`);
+
+    const committeeNotifs = committeeNotifRes.body.data.items || [];
+    const hasEscalationNotif = committeeNotifs.some(
+      (n: any) => n.relatedId === flowActivityId && n.type === 'approval_reminder' && n.title.includes('升级')
+    );
+    expect(hasEscalationNotif).toBe(true);
+
+    const adminUser = await AppDataSource.getRepository(
+      require('../src/entities/User').User
+    ).findOne({ where: { role: 'admin' } });
+
+    if (adminUser) {
+      const adminNotifRes = await req()
+        .get(`/api/notifications/user/${adminUser.id}`);
+      const adminNotifs = adminNotifRes.body.data.items || [];
+      const adminHasEscalation = adminNotifs.some(
+        (n: any) => n.relatedId === flowActivityId && n.type === 'approval_reminder'
+      );
+      expect(adminHasEscalation).toBe(true);
+    }
+  });
+
+  test('6.10 升级后流转记录新增 escalated 节点，当前待办变为团委', async () => {
+    const flowRes = await req()
+      .get(`/api/activities/${flowActivityId}/approval-flow`);
+
+    const flow = flowRes.body.data.items;
+    const escalated = flow.find((f: any) => f.action === 'escalated' && f.level === 'advisor');
+    expect(escalated).toBeDefined();
+
+    const approvalsRes = await req()
+      .get('/api/activities/approvals')
+      .query({ activityId: flowActivityId });
+
+    expect(approvalsRes.body.data.currentLevel).toBe('league_committee');
+  });
+
+  test('6.11 指导老师审批通过（走正常流程），团委变当前待办+有通知', async () => {
+    const newCreateRes = await req()
+      .post('/api/activities')
+      .send({
+        title: '正常流转测试_' + Date.now(),
+        description: '测试正常审批顺序的通知和流转',
+        category: 'training',
+        startTime: '2026-12-01T09:00:00Z',
+        endTime: '2026-12-01T17:00:00Z',
+        budget: 2500,
+        expectedParticipants: 50,
+        clubId
+      });
+
+    const newActivityId = newCreateRes.body.data.id;
+    const submitRes = await req()
+      .post(`/api/activities/${newActivityId}/submit`);
+
+    const advisorAppr = submitRes.body.data.approvals.find((a: any) => a.level === 'advisor');
+    const leagueAppr = submitRes.body.data.approvals.find((a: any) => a.level === 'league_committee');
+
+    const beforeCommitteeNotifsRes = await req()
+      .get(`/api/notifications/user/${committeeId}`);
+    const beforeCount = beforeCommitteeNotifsRes.body.data.items.filter(
+      (n: any) => n.relatedId === newActivityId && n.type === 'activity_approval' && n.title.includes('团委')
+    ).length;
+
+    const advisorProcessRes = await req()
+      .post(`/api/activities/approvals/${advisorAppr.id}/process`)
+      .send({
+        approverId: advisorId,
+        approved: true,
+        comment: '指导老师同意'
+      });
+
+    expect(advisorProcessRes.status).toBe(200);
+
+    const afterCommitteeNotifsRes = await req()
+      .get(`/api/notifications/user/${committeeId}`);
+    const afterCount = afterCommitteeNotifsRes.body.data.items.filter(
+      (n: any) => n.relatedId === newActivityId && n.type === 'activity_approval'
+    ).length;
+
+    expect(afterCount).toBeGreaterThan(beforeCount);
+
+    const approvalsRes = await req()
+      .get('/api/activities/approvals')
+      .query({ activityId: newActivityId });
+
+    expect(approvalsRes.body.data.currentLevel).toBe('league_committee');
+
+    const leagueApprovalItem = approvalsRes.body.data.items.find(
+      (a: any) => a.level === 'league_committee'
+    );
+    expect(leagueApprovalItem.status).toBe('pending');
+  });
+
+  test('6.12 完整流转记录按时间排序，覆盖提交→催办→升级节点', async () => {
+    const flowRes = await req()
+      .get(`/api/activities/${flowActivityId}/approval-flow`);
+
+    const flow = flowRes.body.data.items;
+    expect(flow.length).toBeGreaterThanOrEqual(3);
+
+    const actions = flow.map((f: any) => f.action);
+    expect(actions).toContain('submitted');
+    expect(actions).toContain('reminder');
+    expect(actions).toContain('escalated');
+
+    for (let i = 1; i < flow.length; i++) {
+      expect(new Date(flow[i].createdAt).getTime())
+        .toBeGreaterThanOrEqual(new Date(flow[i - 1].createdAt).getTime());
+    }
+  });
+});
+
+describe('7. 团委超时催办与升级', () => {
+  let leagueTimeoutActivityId: string;
+  let leagueTimeoutAdvisorId: string;
+  let leagueTimeoutLeagueId: string;
+
+  test('7.1 创建超预算活动并让指导老师快速通过', async () => {
+    const createRes = await req()
+      .post('/api/activities')
+      .send({
+        title: '团委超时测试_' + Date.now(),
+        description: '测试团委超时催办和升级到管理员',
+        category: 'charity',
+        startTime: '2026-12-15T09:00:00Z',
+        endTime: '2026-12-15T17:00:00Z',
+        budget: 4000,
+        expectedParticipants: 60,
+        clubId
+      });
+
+    leagueTimeoutActivityId = createRes.body.data.id;
+
+    const submitRes = await req()
+      .post(`/api/activities/${leagueTimeoutActivityId}/submit`);
+
+    const approvals = submitRes.body.data.approvals;
+    leagueTimeoutAdvisorId = approvals.find((a: any) => a.level === 'advisor').id;
+    leagueTimeoutLeagueId = approvals.find((a: any) => a.level === 'league_committee').id;
+
+    await req()
+      .post(`/api/activities/approvals/${leagueTimeoutAdvisorId}/process`)
+      .send({
+        approverId: advisorId,
+        approved: true,
+        comment: '指导老师已通过'
+      });
+
+    const approvalsRes = await req()
+      .get('/api/activities/approvals')
+      .query({ activityId: leagueTimeoutActivityId });
+
+    expect(approvalsRes.body.data.currentLevel).toBe('league_committee');
+  });
+
+  test('7.2 团委第一次超时产生催办通知（团委+管理员都收到）', async () => {
+    const approvalRepo = AppDataSource.getRepository(
+      require('../src/entities/ActivityApproval').ActivityApproval
+    );
+
+    const fiveHoursAgo = new Date(Date.now() - 5 * 60 * 60 * 1000);
+    await approvalRepo.update(leagueTimeoutLeagueId, {
+      createdAt: fiveHoursAgo,
+      lastReminderAt: null
+    });
+
+    const timeoutRes = await req().get('/api/activities/approvals/check-timeouts');
+    expect(timeoutRes.status).toBe(200);
+    expect(timeoutRes.body.data.reminded).toBeGreaterThanOrEqual(1);
+
+    const committeeNotifRes = await req()
+      .get(`/api/notifications/user/${committeeId}`);
+    const committeeNotifs = committeeNotifRes.body.data.items || [];
+    const committeeHasReminder = committeeNotifs.some(
+      (n: any) => n.relatedId === leagueTimeoutActivityId && n.type === 'approval_reminder' && n.title.includes('催办')
+    );
+    expect(committeeHasReminder).toBe(true);
+
+    const adminUser = await AppDataSource.getRepository(
+      require('../src/entities/User').User
+    ).findOne({ where: { role: 'admin' } });
+
+    if (adminUser) {
+      const adminNotifRes = await req()
+        .get(`/api/notifications/user/${adminUser.id}`);
+      const adminNotifs = adminNotifRes.body.data.items || [];
+      const adminHasReminder = adminNotifs.some(
+        (n: any) => n.relatedId === leagueTimeoutActivityId && n.type === 'approval_reminder'
+      );
+      expect(adminHasReminder).toBe(true);
+    }
+  });
+
+  test('7.3 团委第二次超时升级，通知管理员+团委', async () => {
+    const approvalRepo = AppDataSource.getRepository(
+      require('../src/entities/ActivityApproval').ActivityApproval
+    );
+
+    const fiveHoursAgo = new Date(Date.now() - 5 * 60 * 60 * 1000);
+    await approvalRepo.update(leagueTimeoutLeagueId, {
+      lastReminderAt: fiveHoursAgo
+    });
+
+    const timeoutRes = await req().get('/api/activities/approvals/check-timeouts');
+    expect(timeoutRes.status).toBe(200);
+    expect(timeoutRes.body.data.escalated).toBeGreaterThanOrEqual(1);
+
+    const adminUser = await AppDataSource.getRepository(
+      require('../src/entities/User').User
+    ).findOne({ where: { role: 'admin' } });
+
+    if (adminUser) {
+      const adminNotifRes = await req()
+        .get(`/api/notifications/user/${adminUser.id}`);
+      const adminNotifs = adminNotifRes.body.data.items || [];
+      const adminHasEscalation = adminNotifs.filter(
+        (n: any) => n.relatedId === leagueTimeoutActivityId && n.type === 'approval_reminder' && n.title.includes('团委')
+      ).length;
+      expect(adminHasEscalation).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  test('7.4 团委超时后流转记录包含 escalated(团委) 节点', async () => {
+    const flowRes = await req()
+      .get(`/api/activities/${leagueTimeoutActivityId}/approval-flow`);
+
+    const flow = flowRes.body.data.items;
+    const leagueEscalated = flow.find(
+      (f: any) => f.action === 'escalated' && f.level === 'league_committee'
+    );
+    expect(leagueEscalated).toBeDefined();
+    expect(leagueEscalated.description).toContain('管理员');
   });
 });

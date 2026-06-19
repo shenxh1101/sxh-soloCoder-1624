@@ -91,7 +91,7 @@ router.get('/approvals', async (req: Request, res: Response) => {
     const pageNum = parseInt(page as string, 10);
     const pageSizeNum = parseInt(pageSize as string, 10);
 
-    const { items, total } = await activityService.getApprovals(
+    const { items, total, currentLevel } = await activityService.getApprovals(
       activityId as string,
       level as ApprovalLevel,
       status as ApprovalStatus,
@@ -99,7 +99,17 @@ router.get('/approvals', async (req: Request, res: Response) => {
       pageSizeNum
     );
 
-    return paginatedResponse(res, items, total, pageNum, pageSizeNum);
+    return successResponse(res, { items, total, page: pageNum, pageSize: pageSizeNum, currentLevel });
+  } catch (error) {
+    return errorResponse(res, (error as Error).message, 500);
+  }
+});
+
+router.get('/:id/approval-flow', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const flow = await activityService.getApprovalFlow(id);
+    return successResponse(res, { items: flow, total: flow.length });
   } catch (error) {
     return errorResponse(res, (error as Error).message, 500);
   }

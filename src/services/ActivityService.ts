@@ -1,6 +1,6 @@
 import { Repository, Between, LessThanOrEqual, In } from 'typeorm';
-import { Activity, ActivityApproval, Club, User } from '../entities';
-import { ActivityStatus, ApprovalStatus, ApprovalLevel, NotificationType, UserRole } from '../types';
+import { Activity, ActivityApproval, ActivityApprovalFlow, Club, User } from '../entities';
+import { ActivityStatus, ApprovalStatus, ApprovalLevel, NotificationType, UserRole, ApprovalFlowAction } from '../types';
 import { AppDataSource } from '../config/database';
 import { notificationService } from './NotificationService';
 import { clubService } from './ClubService';
@@ -22,14 +22,39 @@ const APPROVAL_TIMEOUT_HOURS = 4;
 class ActivityService {
   private activityRepository: Repository<Activity>;
   private approvalRepository: Repository<ActivityApproval>;
+  private flowRepository: Repository<ActivityApprovalFlow>;
   private clubRepository: Repository<Club>;
   private userRepository: Repository<User>;
 
   constructor() {
     this.activityRepository = AppDataSource.getRepository(Activity);
     this.approvalRepository = AppDataSource.getRepository(ActivityApproval);
+    this.flowRepository = AppDataSource.getRepository(ActivityApprovalFlow);
     this.clubRepository = AppDataSource.getRepository(Club);
     this.userRepository = AppDataSource.getRepository(User);
+  }
+
+  private async addFlowRecord(
+    activityId: string,
+    action: ApprovalFlowAction,
+    options: {
+      level?: ApprovalLevel | null;
+      actorId?: string | null;
+      actorName?: string | null;
+      comment?: string | null;
+      description?: string | null;
+    } = {}
+  ): Promise<ActivityApprovalFlow> {
+    const record = this.flowRepository.create({
+      activityId,
+      action,
+      level: options.level ?? null,
+      actorId: options.actorId ?? null,
+      actorName: options.actorName ?? null,
+      comment: options.comment ?? null,
+      description: options.description ?? null,
+    });
+    return this.flowRepository.save(record);
   }
 
   async createActivity(data: CreateActivityRequest): Promise<Activity> {
@@ -100,18 +125,9 @@ class ActivityService {
         activityId: activity.id,
         activity,
         level: ApprovalLevel.LEAGUE_COMMITTEE,
-        status: ApprovalStatus.PENDING
+        status: ApprovalStatus.QUEUED
       });
       approvals.push(await this.approvalRepository.save(leagueApproval));
-
-      await notificationService.notifyLeadersAndCommittee(
-        NotificationType.ACTIVITY_APPROVAL,
-        '活动审批待处理',
-        `活动 "${activity.title}" 预算 ${activity.budget} 元超支，需要团委审批`,
-        activity.club.leaderId,
-        activity.id,
-        'activity'
-      );
 
       await notificationService.createNotification(
         activity.club.leaderId,
@@ -121,6 +137,10 @@ class ActivityService {
         activity.id,
         'activity'
       );
+
+      await this.addFlowRecord(activity.id, ApprovalFlowAction.SUBMITTED, {
+        description: '活动提交超预算多级审批，当前待指导老师审批',
+      });
     } else {
       activity.status = ActivityStatus.APPROVED;
       activity.approvedAt = new Date();
@@ -133,6 +153,10 @@ class ActivityService {
         activity.id,
         'activity'
       );
+
+      await this.addFlowRecord(activity.id, ApprovalFlowAction.COMPLETED, {
+        description: '活动预算在阈值内，自动通过审批',
+      });
     }
 
     const savedActivity = await this.activityRepository.save(activity);
@@ -154,13 +178,18 @@ class ActivityService {
   ): Promise<ActivityApproval | null> {
     const approval = await this.approvalRepository.findOne({
       where: { id: approvalId },
-      relations: ['activity', 'activity.club', 'activity.approvals']
+      relations: ['activity', 'activity.club', 'activity.approvals', 'approver']
     });
     if (!approval) {
       return null;
     }
 
-    if (approval.status !== ApprovalStatus.PENDING) {
+    if (approval.status === ApprovalStatus.QUEUED) {
+      const levelText = approval.level === ApprovalLevel.ADVISOR ? '指导老师' : '团委';
+      throw new Error(`该审批尚未进入待处理状态（${levelText}），请等待前级审批完成`);
+    }
+
+    if (approval.status !== ApprovalStatus.PENDING && approval.status !== ApprovalStatus.ESCALATED) {
       throw new Error('该审批已处理');
     }
 
@@ -169,9 +198,15 @@ class ActivityService {
         a => a.level === ApprovalLevel.ADVISOR
       );
       if (advisorApproval && advisorApproval.status === ApprovalStatus.PENDING) {
-        throw new Error('指导老师尚未审批，团委不能直接通过。请等待指导老师先完成审批');
+        throw new Error('指导老师尚未审批，团委不能直接处理。请等待指导老师先完成审批');
+      }
+      if (advisorApproval && advisorApproval.status === ApprovalStatus.QUEUED) {
+        throw new Error('指导老师审批尚未启动，团委不能提前处理');
       }
     }
+
+    const approver = await this.userRepository.findOne({ where: { id: approverId } });
+    const approverName = approver?.name || approverId;
 
     approval.approverId = approverId;
     approval.status = approved ? ApprovalStatus.APPROVED : ApprovalStatus.REJECTED;
@@ -180,11 +215,20 @@ class ActivityService {
 
     const savedApproval = await this.approvalRepository.save(approval);
 
+    const levelText = approval.level === ApprovalLevel.ADVISOR ? '指导老师' : '团委';
+    const statusText = approved ? '通过' : '拒绝';
+
+    await this.addFlowRecord(approval.activityId, approved ? ApprovalFlowAction.APPROVED : ApprovalFlowAction.REJECTED, {
+      level: approval.level,
+      actorId: approverId,
+      actorName: approverName,
+      comment: comment || null,
+      description: `${levelText}${statusText}${comment ? `，意见：${comment}` : ''}`,
+    });
+
     await this.checkAndUpdateActivityStatus(approval.activityId);
 
     const activity = approval.activity;
-    const statusText = approved ? '已通过' : '已拒绝';
-    const levelText = approval.level === ApprovalLevel.ADVISOR ? '指导老师' : '团委';
 
     await notificationService.createNotification(
       activity.club.leaderId,
@@ -196,14 +240,13 @@ class ActivityService {
     );
 
     if (approved && approval.level === ApprovalLevel.ADVISOR) {
-      const leagueApproval = await this.approvalRepository.findOne({
-        where: {
-          activityId: activity.id,
-          level: ApprovalLevel.LEAGUE_COMMITTEE,
-          status: ApprovalStatus.PENDING
-        } as unknown as Record<string, unknown>
-      });
-      if (leagueApproval) {
+      const leagueApproval = approval.activity.approvals.find(
+        a => a.level === ApprovalLevel.LEAGUE_COMMITTEE
+      );
+      if (leagueApproval && (leagueApproval.status === ApprovalStatus.QUEUED || leagueApproval.status === ApprovalStatus.PENDING)) {
+        leagueApproval.status = ApprovalStatus.PENDING;
+        await this.approvalRepository.save(leagueApproval);
+
         const committeeUsers = await this.userRepository.find({
           where: { role: In([UserRole.LEAGUE_COMMITTEE, UserRole.ADMIN] as UserRole[]) as unknown as UserRole }
         } as unknown as Record<string, unknown>);
@@ -218,6 +261,11 @@ class ActivityService {
             'activity'
           );
         }
+
+        await this.addFlowRecord(approval.activityId, ApprovalFlowAction.REACTIVATED, {
+          level: ApprovalLevel.LEAGUE_COMMITTEE,
+          description: '指导老师已通过，进入团委审批阶段',
+        });
       }
     }
 
@@ -233,7 +281,7 @@ class ActivityService {
   private async checkAndUpdateActivityStatus(activityId: string): Promise<void> {
     const activity = await this.activityRepository.findOne({
       where: { id: activityId },
-      relations: ['approvals']
+      relations: ['approvals', 'club']
     });
     if (!activity) return;
 
@@ -246,17 +294,22 @@ class ActivityService {
       const rejectedApproval = approvals.find(a => a.status === ApprovalStatus.REJECTED);
       activity.rejectReason = rejectedApproval?.comment || '审批未通过';
       await this.activityRepository.save(activity);
+
+      await this.addFlowRecord(activityId, ApprovalFlowAction.COMPLETED, {
+        description: '审批流程结束：活动被拒绝',
+      });
       return;
     }
-
-    const advisorApproval = approvals.find(a => a.level === ApprovalLevel.ADVISOR);
-    const leagueApproval = approvals.find(a => a.level === ApprovalLevel.LEAGUE_COMMITTEE);
 
     const allApproved = approvals.every(a => a.status === ApprovalStatus.APPROVED);
     if (allApproved) {
       activity.status = ActivityStatus.APPROVED;
       activity.approvedAt = new Date();
       await this.activityRepository.save(activity);
+
+      await this.addFlowRecord(activityId, ApprovalFlowAction.COMPLETED, {
+        description: '审批流程结束：活动已通过全部审批',
+      });
 
       await notificationService.notifyClubMembers(
         activity.clubId,
@@ -268,31 +321,15 @@ class ActivityService {
       );
       return;
     }
-
-    if (advisorApproval?.status === ApprovalStatus.APPROVED && leagueApproval?.status === ApprovalStatus.PENDING) {
-      leagueApproval.escalated = true;
-      leagueApproval.escalatedAt = new Date();
-      await this.approvalRepository.save(leagueApproval);
-
-      await notificationService.notifyLeadersAndCommittee(
-        NotificationType.ACTIVITY_APPROVAL,
-        '活动审批待团委处理',
-        `活动 "${activity.title}" 已通过指导老师审批，请团委及时处理`,
-        undefined,
-        activity.id,
-        'activity'
-      );
-    }
   }
 
-  async checkApprovalTimeouts(): Promise<{ reminded: number; escalated: number }> {
+  async checkApprovalTimeouts(): Promise<{ reminded: number; escalated: number; }> {
     const now = new Date();
     const timeoutDate = new Date(now.getTime() - APPROVAL_TIMEOUT_HOURS * 60 * 60 * 1000);
 
     const pendingApprovals = await this.approvalRepository.find({
       where: {
-        status: ApprovalStatus.PENDING,
-        createdAt: LessThanOrEqual(timeoutDate) as unknown as Date
+        status: In([ApprovalStatus.PENDING, ApprovalStatus.ESCALATED] as ApprovalStatus[]) as unknown as ApprovalStatus,
       } as unknown as Record<string, unknown>,
       relations: ['activity', 'activity.club'],
       order: { createdAt: 'ASC' }
@@ -314,14 +351,14 @@ class ActivityService {
       const activity = approval.activity;
       const levelText = approval.level === ApprovalLevel.ADVISOR ? '指导老师' : '团委';
 
-      if (approval.reminderCount >= 2) {
+      if (approval.level === ApprovalLevel.ADVISOR && approval.reminderCount >= 2) {
         approval.status = ApprovalStatus.ESCALATED;
         approval.escalated = true;
         approval.escalatedAt = now;
         await this.approvalRepository.save(approval);
         escalated++;
 
-        if (approval.level === ApprovalLevel.ADVISOR && activity.club.advisorId) {
+        if (activity.club.advisorId) {
           await notificationService.createNotification(
             activity.club.advisorId,
             NotificationType.APPROVAL_REMINDER,
@@ -330,28 +367,96 @@ class ActivityService {
             activity.id,
             'activity'
           );
+        }
 
-          await notificationService.notifyLeadersAndCommittee(
+        const leagueApproval = await this.approvalRepository.findOne({
+          where: {
+            activityId: activity.id,
+            level: ApprovalLevel.LEAGUE_COMMITTEE,
+          }
+        });
+        if (leagueApproval) {
+          leagueApproval.status = ApprovalStatus.PENDING;
+          leagueApproval.escalated = true;
+          leagueApproval.escalatedAt = now;
+          await this.approvalRepository.save(leagueApproval);
+
+          const committeeUsers = await this.userRepository.find({
+            where: { role: In([UserRole.LEAGUE_COMMITTEE, UserRole.ADMIN] as UserRole[]) as unknown as UserRole }
+          } as unknown as Record<string, unknown>);
+          for (const cu of committeeUsers) {
+            await notificationService.createNotification(
+              cu.id,
+              NotificationType.APPROVAL_REMINDER,
+              '审批超时升级通知',
+              `活动 "${activity.title}" 的指导老师审批已超时，已升级至团委处理，请及时审批`,
+              activity.id,
+              'activity'
+            );
+          }
+        }
+
+        await this.addFlowRecord(activity.id, ApprovalFlowAction.ESCALATED, {
+          level: ApprovalLevel.ADVISOR,
+          description: `指导老师审批超时 ${APPROVAL_TIMEOUT_HOURS * approval.reminderCount} 小时，已升级至团委`,
+        });
+
+        await notificationService.createNotification(
+          activity.club.leaderId,
+          NotificationType.APPROVAL_REMINDER,
+          '审批进度提醒',
+          `活动 "${activity.title}" 的指导老师审批已超时，已自动升级至团委处理`,
+          activity.id,
+          'activity'
+        );
+      } else if (approval.level === ApprovalLevel.LEAGUE_COMMITTEE && approval.reminderCount >= 2) {
+        approval.status = ApprovalStatus.ESCALATED;
+        approval.escalated = true;
+        approval.escalatedAt = now;
+        await this.approvalRepository.save(approval);
+        escalated++;
+
+        const adminUsers = await this.userRepository.find({
+          where: { role: UserRole.ADMIN }
+        });
+        for (const au of adminUsers) {
+          await notificationService.createNotification(
+            au.id,
             NotificationType.APPROVAL_REMINDER,
-            '审批超时升级通知',
-            `活动 "${activity.title}" 的${levelText}审批已超时，已自动升级至团委处理`,
-            activity.club.leaderId,
+            '团委审批超时升级通知',
+            `活动 "${activity.title}" 的团委审批已超时 ${APPROVAL_TIMEOUT_HOURS * approval.reminderCount} 小时，请管理员关注`,
             activity.id,
             'activity'
           );
-
-          const leagueApproval = await this.approvalRepository.findOne({
-            where: {
-              activityId: activity.id,
-              level: ApprovalLevel.LEAGUE_COMMITTEE
-            }
-          });
-          if (leagueApproval) {
-            leagueApproval.escalated = true;
-            leagueApproval.escalatedAt = now;
-            await this.approvalRepository.save(leagueApproval);
-          }
         }
+
+        const committeeUsers = await this.userRepository.find({
+          where: { role: UserRole.LEAGUE_COMMITTEE }
+        });
+        for (const cu of committeeUsers) {
+          await notificationService.createNotification(
+            cu.id,
+            NotificationType.APPROVAL_REMINDER,
+            '审批催办通知',
+            `活动 "${activity.title}" 的团委审批已待处理 ${APPROVAL_TIMEOUT_HOURS * approval.reminderCount} 小时，请及时处理（第 ${approval.reminderCount} 次提醒）`,
+            activity.id,
+            'activity'
+          );
+        }
+
+        await this.addFlowRecord(activity.id, ApprovalFlowAction.ESCALATED, {
+          level: ApprovalLevel.LEAGUE_COMMITTEE,
+          description: `团委审批超时 ${APPROVAL_TIMEOUT_HOURS * approval.reminderCount} 小时，已通知管理员`,
+        });
+
+        await notificationService.createNotification(
+          activity.club.leaderId,
+          NotificationType.APPROVAL_REMINDER,
+          '审批进度提醒',
+          `活动 "${activity.title}" 的团委审批已超时，已通知管理员跟进`,
+          activity.id,
+          'activity'
+        );
       } else {
         reminded++;
         const approverId = approval.approverId;
@@ -364,6 +469,36 @@ class ActivityService {
             activity.id,
             'activity'
           );
+        } else if (approval.level === ApprovalLevel.LEAGUE_COMMITTEE) {
+          const committeeUsers = await this.userRepository.find({
+            where: { role: UserRole.LEAGUE_COMMITTEE }
+          });
+          for (const cu of committeeUsers) {
+            await notificationService.createNotification(
+              cu.id,
+              NotificationType.APPROVAL_REMINDER,
+              '审批催办通知',
+              `活动 "${activity.title}" 的团委审批已待处理 ${APPROVAL_TIMEOUT_HOURS} 小时，请及时处理（第 ${approval.reminderCount} 次提醒）`,
+              activity.id,
+              'activity'
+            );
+          }
+        }
+
+        if (approval.level === ApprovalLevel.LEAGUE_COMMITTEE) {
+          const adminUsers = await this.userRepository.find({
+            where: { role: UserRole.ADMIN }
+          });
+          for (const au of adminUsers) {
+            await notificationService.createNotification(
+              au.id,
+              NotificationType.APPROVAL_REMINDER,
+              '团委审批催办提醒',
+              `活动 "${activity.title}" 的团委审批已待处理 ${APPROVAL_TIMEOUT_HOURS} 小时，请关注`,
+              activity.id,
+              'activity'
+            );
+          }
         }
 
         await notificationService.createNotification(
@@ -374,6 +509,11 @@ class ActivityService {
           activity.id,
           'activity'
         );
+
+        await this.addFlowRecord(activity.id, ApprovalFlowAction.REMINDER, {
+          level: approval.level,
+          description: `第 ${approval.reminderCount} 次催办：${levelText}审批已待处理 ${APPROVAL_TIMEOUT_HOURS} 小时`,
+        });
       }
     }
 
@@ -385,6 +525,26 @@ class ActivityService {
       where: { id: activityId },
       relations: ['club', 'approvals', 'bookings', 'attendances']
     });
+  }
+
+  async getApprovalFlow(activityId: string): Promise<ActivityApprovalFlow[]> {
+    return this.flowRepository.find({
+      where: { activityId },
+      order: { createdAt: 'ASC' }
+    });
+  }
+
+  getCurrentApprovalLevel(approvals: ActivityApproval[]): ApprovalLevel | null {
+    const advisor = approvals.find(a => a.level === ApprovalLevel.ADVISOR);
+    const league = approvals.find(a => a.level === ApprovalLevel.LEAGUE_COMMITTEE);
+
+    if (advisor && advisor.status === ApprovalStatus.PENDING) {
+      return ApprovalLevel.ADVISOR;
+    }
+    if (league && (league.status === ApprovalStatus.PENDING || league.status === ApprovalStatus.ESCALATED)) {
+      return ApprovalLevel.LEAGUE_COMMITTEE;
+    }
+    return null;
   }
 
   async getActivities(
@@ -426,7 +586,7 @@ class ActivityService {
     status?: ApprovalStatus,
     page = 1,
     pageSize = 20
-  ): Promise<{ items: ActivityApproval[]; total: number }> {
+  ): Promise<{ items: ActivityApproval[]; total: number; currentLevel: ApprovalLevel | null }> {
     const where: Record<string, unknown> = {};
     if (activityId) where.activityId = activityId;
     if (level) where.level = level;
@@ -434,12 +594,19 @@ class ActivityService {
 
     const [items, total] = await this.approvalRepository.findAndCount({
       where,
-      order: { createdAt: 'DESC' },
+      relations: ['activity', 'approver'],
+      order: { createdAt: 'ASC' },
       skip: (page - 1) * pageSize,
       take: pageSize
     });
 
-    return { items, total };
+    let currentLevel: ApprovalLevel | null = null;
+    if (activityId) {
+      const allApprovals = await this.approvalRepository.find({ where: { activityId } });
+      currentLevel = this.getCurrentApprovalLevel(allApprovals);
+    }
+
+    return { items, total, currentLevel };
   }
 
   async completeActivity(activityId: string, actualCost: number, actualParticipants: number): Promise<Activity | null> {
