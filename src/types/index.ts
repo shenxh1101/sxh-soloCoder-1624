@@ -64,7 +64,18 @@ export enum ApprovalStatus {
   APPROVED = 'approved',
   REJECTED = 'rejected',
   ESCALATED = 'escalated',
-  TIMEOUT = 'timeout'
+  TIMEOUT = 'timeout',
+  QUEUED = 'queued'
+}
+
+export enum ApprovalFlowAction {
+  SUBMITTED = 'submitted',
+  APPROVED = 'approved',
+  REJECTED = 'rejected',
+  REMINDER = 'reminder',
+  ESCALATED = 'escalated',
+  COMPLETED = 'completed',
+  REACTIVATED = 'reactivated'
 }
 
 export enum ApprovalLevel {

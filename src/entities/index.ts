@@ -5,6 +5,7 @@ export { Venue } from './Venue';
 export { Activity } from './Activity';
 export { VenueBooking } from './VenueBooking';
 export { ActivityApproval } from './ActivityApproval';
+export { ActivityApprovalFlow } from './ActivityApprovalFlow';
 export { Attendance } from './Attendance';
 export { ClubPoints } from './ClubPoints';
 export { ActivityWarning } from './ActivityWarning';

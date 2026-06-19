@@ -7,6 +7,7 @@ import { Venue } from '../entities/Venue';
 import { Activity } from '../entities/Activity';
 import { VenueBooking } from '../entities/VenueBooking';
 import { ActivityApproval } from '../entities/ActivityApproval';
+import { ActivityApprovalFlow } from '../entities/ActivityApprovalFlow';
 import { Attendance } from '../entities/Attendance';
 import { ClubPoints } from '../entities/ClubPoints';
 import { ActivityWarning } from '../entities/ActivityWarning';
@@ -29,6 +30,7 @@ export const AppDataSource = new DataSource({
     Activity,
     VenueBooking,
     ActivityApproval,
+    ActivityApprovalFlow,
     Attendance,
     ClubPoints,
     ActivityWarning,
