@@ -58,9 +58,6 @@ router.post('/', async (req: Request, res: Response) => {
     if (!description) errors.push('社团描述不能为空');
     if (!category) errors.push('社团类别不能为空');
     if (!leaderId) errors.push('社长ID不能为空');
-    if (!memberIds || !Array.isArray(memberIds) || memberIds.length === 0) {
-      errors.push('成员列表不能为空');
-    }
 
     if (errors.length > 0) {
       return validationErrorResponse(res, errors);
@@ -71,7 +68,7 @@ router.post('/', async (req: Request, res: Response) => {
       description,
       category,
       leaderId,
-      memberIds,
+      memberIds: memberIds || [],
       advisorId
     });
 

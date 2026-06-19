@@ -36,27 +36,47 @@ class ClubService {
   async validateClubApplication(data: CreateClubRequest): Promise<ValidateClubResult> {
     const errors: string[] = [];
 
-    const existingClub = await this.clubRepository.findOne({
-      where: { name: data.name.trim() } as unknown as Record<string, unknown>
-    });
-    if (existingClub) {
-      errors.push(`社团名称 "${data.name}" 已存在，请使用其他名称`);
+    if (!data.name || !data.name.trim()) {
+      errors.push('社团名称不能为空');
+    } else {
+      const existingClub = await this.clubRepository.findOne({
+        where: { name: data.name.trim() } as unknown as Record<string, unknown>
+      });
+      if (existingClub) {
+        errors.push(`社团名称 "${data.name}" 已存在，请使用其他名称`);
+      }
     }
 
-    const uniqueMemberIds = [...new Set(data.memberIds)];
+    if (!data.description || !data.description.trim()) {
+      errors.push('社团描述不能为空');
+    }
+
+    if (!data.category || !data.category.trim()) {
+      errors.push('社团类别不能为空');
+    }
+
+    const allIds = [data.leaderId, ...(data.memberIds || [])];
+    const uniqueMemberIds = [...new Set(allIds.filter(Boolean))];
+
+    if (!data.leaderId) {
+      errors.push('社长ID不能为空');
+    } else if (!uniqueMemberIds.includes(data.leaderId)) {
+      uniqueMemberIds.push(data.leaderId);
+    }
+
     if (uniqueMemberIds.length < MIN_INITIAL_MEMBERS) {
-      errors.push(`初始成员人数不足，最少需要 ${MIN_INITIAL_MEMBERS} 人，当前仅 ${uniqueMemberIds.length} 人`);
+      errors.push(`初始成员人数不足，最少需要 ${MIN_INITIAL_MEMBERS} 人（含社长），当前仅 ${uniqueMemberIds.length} 人`);
     }
 
-    if (!uniqueMemberIds.includes(data.leaderId)) {
-      errors.push('社长必须在初始成员列表中');
-    }
-
-    const validUsers = await this.userRepository.find({
-      where: { id: In([data.leaderId, ...uniqueMemberIds]) }
-    });
-    if (validUsers.length !== uniqueMemberIds.length + 1) {
-      errors.push('存在无效的用户ID');
+    if (uniqueMemberIds.length > 0) {
+      const validUsers = await this.userRepository.find({
+        where: { id: In(uniqueMemberIds) }
+      });
+      if (validUsers.length !== uniqueMemberIds.length) {
+        const foundIds = validUsers.map(u => u.id);
+        const invalidIds = uniqueMemberIds.filter(id => !foundIds.includes(id));
+        errors.push(`以下用户ID不存在：${invalidIds.join(', ')}`);
+      }
     }
 
     if (data.advisorId) {
@@ -68,51 +88,28 @@ class ClubService {
       }
     }
 
-    if (!data.name.trim()) {
-      errors.push('社团名称不能为空');
-    }
-
-    if (!data.description.trim()) {
-      errors.push('社团描述不能为空');
-    }
-
-    if (!data.category.trim()) {
-      errors.push('社团类别不能为空');
-    }
-
     return {
       valid: errors.length === 0,
       errors
     };
   }
 
-  async createClubApplication(data: CreateClubRequest): Promise<{ club: Club; validation: ValidateClubResult }> {
+  async createClubApplication(data: CreateClubRequest): Promise<{ club: Club | null; validation: ValidateClubResult }> {
     const validation = await this.validateClubApplication(data);
 
     if (!validation.valid) {
       const rejectReason = validation.errors.join('；');
-      const club = this.clubRepository.create({
-        name: data.name.trim(),
-        description: data.description.trim(),
-        category: data.category.trim(),
-        leaderId: data.leaderId,
-        advisorId: data.advisorId || null,
-        status: ClubStatus.REJECTED,
-        rejectReason
-      });
-
-      const savedClub = await this.clubRepository.save(club);
 
       await notificationService.createNotification(
         data.leaderId,
         NotificationType.CLUB_APPLICATION,
         '社团申请被退回',
-        `您的社团 "${savedClub.name}" 创建申请未通过，原因：${rejectReason}`,
-        savedClub.id,
+        `社团 "${data.name}" 创建申请未通过，原因：${rejectReason}`,
+        undefined,
         'club'
       );
 
-      return { club: savedClub, validation };
+      return { club: null, validation };
     }
 
     const leader = await this.userRepository.findOne({ where: { id: data.leaderId } });
@@ -133,8 +130,10 @@ class ClubService {
 
     const savedClub = await this.clubRepository.save(club);
 
+    const allIds = [data.leaderId, ...(data.memberIds || [])];
+    const uniqueMemberIds = [...new Set(allIds.filter(Boolean))];
+
     const members: ClubMember[] = [];
-    const uniqueMemberIds = [...new Set(data.memberIds)];
 
     for (const userId of uniqueMemberIds) {
       const user = await this.userRepository.findOne({ where: { id: userId } });

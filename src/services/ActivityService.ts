@@ -1,5 +1,5 @@
-import { Repository, Between, LessThanOrEqual } from 'typeorm';
-import { Activity, ActivityApproval, Club } from '../entities';
+import { Repository, Between, LessThanOrEqual, In } from 'typeorm';
+import { Activity, ActivityApproval, Club, User } from '../entities';
 import { ActivityStatus, ApprovalStatus, ApprovalLevel, NotificationType, UserRole } from '../types';
 import { AppDataSource } from '../config/database';
 import { notificationService } from './NotificationService';
@@ -23,11 +23,13 @@ class ActivityService {
   private activityRepository: Repository<Activity>;
   private approvalRepository: Repository<ActivityApproval>;
   private clubRepository: Repository<Club>;
+  private userRepository: Repository<User>;
 
   constructor() {
     this.activityRepository = AppDataSource.getRepository(Activity);
     this.approvalRepository = AppDataSource.getRepository(ActivityApproval);
     this.clubRepository = AppDataSource.getRepository(Club);
+    this.userRepository = AppDataSource.getRepository(User);
   }
 
   async createActivity(data: CreateActivityRequest): Promise<Activity> {
@@ -152,7 +154,7 @@ class ActivityService {
   ): Promise<ActivityApproval | null> {
     const approval = await this.approvalRepository.findOne({
       where: { id: approvalId },
-      relations: ['activity', 'activity.club']
+      relations: ['activity', 'activity.club', 'activity.approvals']
     });
     if (!approval) {
       return null;
@@ -160,6 +162,15 @@ class ActivityService {
 
     if (approval.status !== ApprovalStatus.PENDING) {
       throw new Error('该审批已处理');
+    }
+
+    if (approval.level === ApprovalLevel.LEAGUE_COMMITTEE) {
+      const advisorApproval = approval.activity.approvals.find(
+        a => a.level === ApprovalLevel.ADVISOR
+      );
+      if (advisorApproval && advisorApproval.status === ApprovalStatus.PENDING) {
+        throw new Error('指导老师尚未审批，团委不能直接通过。请等待指导老师先完成审批');
+      }
     }
 
     approval.approverId = approverId;
@@ -183,6 +194,32 @@ class ActivityService {
       activity.id,
       'activity'
     );
+
+    if (approved && approval.level === ApprovalLevel.ADVISOR) {
+      const leagueApproval = await this.approvalRepository.findOne({
+        where: {
+          activityId: activity.id,
+          level: ApprovalLevel.LEAGUE_COMMITTEE,
+          status: ApprovalStatus.PENDING
+        } as unknown as Record<string, unknown>
+      });
+      if (leagueApproval) {
+        const committeeUsers = await this.userRepository.find({
+          where: { role: In([UserRole.LEAGUE_COMMITTEE, UserRole.ADMIN] as UserRole[]) as unknown as UserRole }
+        } as unknown as Record<string, unknown>);
+
+        for (const cu of committeeUsers) {
+          await notificationService.createNotification(
+            cu.id,
+            NotificationType.ACTIVITY_APPROVAL,
+            '活动审批待团委处理',
+            `活动 "${activity.title}" 已通过指导老师审批，请您进行团委审批`,
+            activity.id,
+            'activity'
+          );
+        }
+      }
+    }
 
     notificationService.broadcastStatusUpdate(
       [activity.club.leaderId],

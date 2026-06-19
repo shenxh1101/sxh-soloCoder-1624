@@ -18,6 +18,8 @@ import warningRoutes from './routes/warning.routes';
 import reportRoutes from './routes/report.routes';
 import notificationRoutes from './routes/notification.routes';
 import userRoutes from './routes/user.routes';
+import reimbursementRoutes from './routes/reimbursement.routes';
+import abnormalOrderRoutes from './routes/abnormal-order.routes';
 
 import { errorResponse } from './utils/response';
 
@@ -53,10 +55,12 @@ app.get('/api/health', (req: Request, res: Response) => {
 app.use('/api/clubs', clubRoutes);
 app.use('/api/venues', venueRoutes);
 app.use('/api/activities', activityRoutes);
-app.use('/api', warningRoutes);
+app.use('/api/warnings', warningRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/reimbursements', reimbursementRoutes);
+app.use('/api/abnormal-orders', abnormalOrderRoutes);
 
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   console.error('Unhandled error:', err);
